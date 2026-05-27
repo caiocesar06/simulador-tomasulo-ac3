@@ -1,0 +1,28 @@
+{
+  "config": {
+    "ciclos": {
+      "ciclosInt": 1,
+      "ciclosLoad": 2,
+      "ciclosStore": 2,
+      "ciclosFPAdd": 4,
+      "ciclosFPMul": 8,
+      "ciclosFPDiv": 12
+    },
+    "unidades": {
+      "fuLoad": 1,
+      "fuStore": 1,
+      "fuInt": 1,
+      "fuFPAdd": 1,
+      "fuFPMul": 1
+    },
+    "branchPrediction": "not-taken",
+    "robSize": 8
+  },
+  "insts": [
+    { "D": "ADDD", "R": "F2", "S": "F4", "T": "F6" },
+    { "D": "BNEZ", "R": "R1", "S": "target", "T": "" },
+    { "D": "MULTD", "R": "F8", "S": "F2", "T": "F10" },
+    { "D": "ADDD", "R": "F10", "S": "F8", "T": "F12" },
+    { "D": "LD", "R": "F14", "S": "0", "T": "R2" }
+  ]
+}

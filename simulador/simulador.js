@@ -6,6 +6,7 @@
             "ciclos": CONFIG["ciclos"],       // numero de ciclos gastos por cada UF
             "unidades": CONFIG["unidades"]    // número de ufs
         };
+        this.despachoDuplo = CONFIG["despachoDuplo"] || false;
 
         // cria o vetor de instrucoes
         this.estadoInstrucoes = [];
@@ -22,7 +23,10 @@
             linha["issue"] = null;                     // ciclo onde ocorreu o issue
             linha["exeCompleta"] = null;               // ciclo onde a execucao terminou
             linha["write"] = null;                     // ciclo onde foi escrito
+            linha["commit"] = null;                    // ciclo onde comitou
             linha["busy"] = false;                     // se instrução está busy ou não 
+            linha["despachoSegundo"] = false;          // marca a segunda instrução do despacho duplo
+            linha["robTag"] = null;                    // identificador da entrada no ROB
             this.estadoInstrucoes[i] = linha;
 
         }
@@ -46,6 +50,7 @@
                 unidadeFuncional["vk"] = null;                  // valor de k
                 unidadeFuncional["qj"] = null;                  // uf que esta gerando j
                 unidadeFuncional["qk"] = null;                  // uf que esta gerando k
+                unidadeFuncional["robTag"] = null;              // tag da entrada do ROB associada
 
                 this.unidadesFuncionais[nome] = unidadeFuncional;
             }
@@ -71,6 +76,7 @@
                 unidadeFuncionalMemoria["operacao"] = null;             // operacao que esta sendo executada
                 unidadeFuncionalMemoria["endereco"] = null;             // endereco onde vai ser buscado
                 unidadeFuncionalMemoria["destino"] = null;              // registrador de destino
+                unidadeFuncionalMemoria["robTag"] = null;               // tag da entrada do ROB associada
 
                 this.unidadesFuncionaisMemoria[nome] = unidadeFuncionalMemoria;
             }
@@ -87,6 +93,18 @@
         for(let i = 0; i < 32; i += 1) {
             this.estacaoRegistradores["R" + i] = null;
         }
+
+        this.rob = [];
+        this.robCapacidade = CONFIG["robSize"] || 8;
+        this.robHead = 0;
+        this.robTail = 0;
+        this.robCount = 0;
+        this.branchPrediction = CONFIG["branchPrediction"] || "not-taken";
+        this.especulando = false;
+        this.branchRobIndex = null;
+        this.instrucoesPendenteFlush = [];
+        this.snapshotEstacaoRegistradores = null;
+        this.flushTagsNoCiclo = {};
     }
 
     getNovaInstrucao() {
@@ -100,6 +118,69 @@
                 return element;
         }
         return undefined;
+    }
+
+    getNovaInstrucaoDepois(indiceAtual) {
+        for (let i = indiceAtual + 1; i < this.estadoInstrucoes.length; i++) {
+            const element = this.estadoInstrucoes[i];
+            if (element.issue == null) {
+                return element;
+            }
+        }
+        return undefined;
+    }
+
+    getInstrucaoTexto(instrucao) {
+        return `${instrucao.operacao} ${instrucao.registradorR}, ${instrucao.registradorS}, ${instrucao.registradorT}`;
+    }
+
+    temEspacoROB() {
+        return this.robCount < this.robCapacidade;
+    }
+
+    alocaEntradaROB(estadoInstrucao, especulativo, tipoInstrucao) {
+        const indice = this.robTail;
+        const instrucao = estadoInstrucao.instrucao;
+        const registradorDestino = (instrucao.operacao === "SD" || instrucao.operacao === "BEQ" || instrucao.operacao === "BNEZ")
+            ? null
+            : instrucao.registradorR;
+        const entrada = {
+            indice: indice,
+            instrucao: instrucao,
+            estadoInstrucao: estadoInstrucao,
+            registradorDestino: registradorDestino,
+            valor: null,
+            pronto: false,
+            commitado: false,
+            especulativo: especulativo,
+            tipoInstrucao: tipoInstrucao
+        };
+        this.rob.push(entrada);
+        this.robTail = (this.robTail + 1) % this.robCapacidade;
+        this.robCount++;
+        return entrada;
+    }
+
+    getEntradaROBPorTag(robTag) {
+        if (!robTag || !robTag.startsWith("ROB")) {
+            return null;
+        }
+        const indice = parseInt(robTag.replace("ROB", ""));
+        for (let i = 0; i < this.rob.length; i++) {
+            if (this.rob[i].indice === indice) {
+                return this.rob[i];
+            }
+        }
+        return null;
+    }
+
+    getCabecaROB() {
+        for (let i = 0; i < this.rob.length; i++) {
+            if (this.rob[i].indice === this.robHead) {
+                return this.rob[i];
+            }
+        }
+        return null;
     }
 
     verificaUFInstrucao(instrucao) {
@@ -206,7 +287,7 @@
             let UFQueTemQueEsperar = this.estacaoRegistradores[instrucao.registradorR];
 
             // caso o nome seja de uma das unidades funcionais, marca que tem que esperar ela
-            if ((UFQueTemQueEsperar in this.unidadesFuncionais) || (UFQueTemQueEsperar in this.unidadesFuncionaisMemoria))
+            if ((UFQueTemQueEsperar in this.unidadesFuncionais) || (UFQueTemQueEsperar in this.unidadesFuncionaisMemoria) || (typeof UFQueTemQueEsperar === "string" && UFQueTemQueEsperar.startsWith("ROB")))
                 uf.qi = UFQueTemQueEsperar;
             else
                 uf.qi = null;
@@ -217,7 +298,7 @@
         let UFintQueTemQueEsperar = this.estacaoRegistradores[instrucao.registradorT];
 
         // caso o nome seja de uma das unidades funcionais, marca que tem que esperar ela
-        if ((UFintQueTemQueEsperar in this.unidadesFuncionais) || (UFintQueTemQueEsperar in this.unidadesFuncionaisMemoria))
+        if ((UFintQueTemQueEsperar in this.unidadesFuncionais) || (UFintQueTemQueEsperar in this.unidadesFuncionaisMemoria) || (typeof UFintQueTemQueEsperar === "string" && UFintQueTemQueEsperar.startsWith("ROB")))
             uf.qj = UFintQueTemQueEsperar;
         else
             uf.qj = null;
@@ -261,7 +342,7 @@
             uf.vj = reg_j_inst;
         else {
             // caso o nome seja uma unidade funcional, este registrador vai ter o valor escrito ainda, entao tem que esperar
-            if ((reg_j in this.unidadesFuncionais) || (reg_j in this.unidadesFuncionaisMemoria))
+            if ((reg_j in this.unidadesFuncionais) || (reg_j in this.unidadesFuncionaisMemoria) || (typeof reg_j === "string" && reg_j.startsWith("ROB")))
                 uf.qj = reg_j;
             else
                 uf.vj = reg_j;
@@ -272,7 +353,7 @@
             uf.vk = reg_k_inst;
         else {
             // caso o nome seja uma unidade funcional, este registrador vai ter o valor escrito ainda, entao tem que esperar
-            if ((reg_k in this.unidadesFuncionais) || (reg_k in this.unidadesFuncionaisMemoria))
+            if ((reg_k in this.unidadesFuncionais) || (reg_k in this.unidadesFuncionaisMemoria) || (typeof reg_k === "string" && reg_k.startsWith("ROB")))
                 uf.qk = reg_k;
             else
                 uf.vk = reg_k;
@@ -280,8 +361,9 @@
     }
 
 
-    liberaUFEsperandoResultado(UF) {
+    liberaUFEsperandoResultado(UF, identificador) {
         // funcao que libera as uf que esta esperando essa terminar
+        const produtor = identificador || UF.nome;
 
         // percorre todas as unidades funcionais
         for(let keyUF in this.unidadesFuncionais) {
@@ -289,18 +371,18 @@
 
             // se a unidade esta ocupada e o esta esperando esta uf em qj ou qk
             if ((ufOlhando.ocupado === true) &&
-                ((ufOlhando.qj === UF.nome) ||
-                    (ufOlhando.qk === UF.nome))) {
+                ((ufOlhando.qj === produtor) ||
+                    (ufOlhando.qk === produtor))) {
 
                 // olha se esta esperando em qj, se estiver
-                if (ufOlhando.qj === UF.nome) {
-                    ufOlhando.vj = 'VAL(' + UF.nome + ')';   // escreve como vj o valor da uf
+                if (ufOlhando.qj === produtor) {
+                    ufOlhando.vj = 'VAL(' + produtor + ')';   // escreve como vj o valor da uf
                     ufOlhando.qj = null;                     // retira a espera em qj
                 }
 
                 // olha se esta esperando em qk, se estiver
-                if (ufOlhando.qk === UF.nome) {
-                    ufOlhando.vk = 'VAL(' + UF.nome + ')';   // escreve como vj o valor da uf
+                if (ufOlhando.qk === produtor) {
+                    ufOlhando.vk = 'VAL(' + produtor + ')';   // escreve como vj o valor da uf
                     ufOlhando.qk = null;                     // retira a espera em qj
                 }
 
@@ -318,10 +400,10 @@
             // se unidade estiver ocuapda
             if (ufOlhando.ocupado === true) {
                 // caso esteja esperando a unidade, libera ela e subtrai o ciclo extra
-                if (ufOlhando.qi === UF.nome) {
+                if (ufOlhando.qi === produtor) {
                     ufOlhando.qi = null;
                     ufOlhando.tempo = ufOlhando.tempo - 1;
-                } else if (ufOlhando.qj === UF.nome) {
+                } else if (ufOlhando.qj === produtor) {
                     ufOlhando.qj = null;
                     ufOlhando.tempo = ufOlhando.tempo - 1;
                 }
@@ -340,6 +422,7 @@
         ufMem.destino = null;
         ufMem.qi = null;
         ufMem.qj = null;
+        ufMem.robTag = null;
     }
 
     desalocaUF(uf) {
@@ -353,6 +436,7 @@
         uf.vk = null;
         uf.qj = null;
         uf.qk = null;
+        uf.robTag = null;
     }
 
     verificaSeJaTerminou() {
@@ -363,39 +447,88 @@
         for (let i = 0; i < this.estadoInstrucoes.length; i++) {
             const element = this.estadoInstrucoes[i];
 
-            if (element.write === null)
+            const entradaROB = element.robTag ? this.getEntradaROBPorTag(element.robTag) : null;
+            const terminouInstrucao = entradaROB ? entradaROB.commitado : element.write !== null;
+            if (!terminouInstrucao)
                 qtdInstrucaoNaoTerminada++;
         }
 
         return qtdInstrucaoNaoTerminada > 0 ? false : true;
     }
 
-    issueNovaInstrucao() {
-        // funcao da fase de issue do tomasulo
-
-        let novaInstrucao = this.getNovaInstrucao();  // busca uma nova instrucao
-
-        // se existe uma nova instrucao pra executar o issue
-        if (novaInstrucao) {
-            let ufInstrucao = this.verificaUFInstrucao(novaInstrucao.instrucao);  // verifica qual unidade essa instrucao usa
-            let UFParaUsar = this.getFUVazia(ufInstrucao);                        // pega a primeira unidade disponivel
-
-            // caso exista uma unidade livre, caso contrario, nao faz nada (bolha)
-            if (UFParaUsar) {
-                // se a unidade e de memoria, aloca uma unidade de memoria, caso contrario uma unidade normal
-                if ((UFParaUsar.tipoUnidade == 'Load') || (UFParaUsar.tipoUnidade == 'Store'))
-                    this.alocaFuMem(UFParaUsar, novaInstrucao.instrucao, novaInstrucao);
-                else
-                    this.alocaFU(UFParaUsar, novaInstrucao.instrucao, novaInstrucao);
-
-                // escreve em qual ciclo o issue aconteceu
-                novaInstrucao.issue = this.clock;
-
-                // caso a instrucao tenha escrita no registrador de destino, esqueve
-                if ((UFParaUsar.tipoUnidade !== 'Store') && (UFParaUsar.operacao !== 'BEQ') && (UFParaUsar.operacao !== 'BEQ'))
-                    this.escreveEstacaoRegistrador(novaInstrucao.instrucao, UFParaUsar.nome);
-            }
+    tentaEmitirInstrucao(estadoInstrucao, despachoSegundo) {
+        if (!estadoInstrucao || !this.temEspacoROB()) {
+            return false;
         }
+
+        const ufInstrucao = this.verificaUFInstrucao(estadoInstrucao.instrucao);
+        const UFParaUsar = this.getFUVazia(ufInstrucao);
+        if (!UFParaUsar) {
+            return false;
+        }
+
+        const operacao = estadoInstrucao.instrucao.operacao;
+        const tipoInstrucao = (operacao === "SD") ? "store" : ((operacao === "BEQ" || operacao === "BNEZ") ? "branch" : "normal");
+        const especulativo = this.especulando;
+        const entradaROB = this.alocaEntradaROB(estadoInstrucao, especulativo, tipoInstrucao);
+        const robTag = "ROB" + entradaROB.indice;
+
+        estadoInstrucao.issue = this.clock;
+        estadoInstrucao.despachoSegundo = despachoSegundo;
+        estadoInstrucao.robTag = robTag;
+        UFParaUsar.robTag = robTag;
+
+        if ((UFParaUsar.tipoUnidade == 'Load') || (UFParaUsar.tipoUnidade == 'Store'))
+            this.alocaFuMem(UFParaUsar, estadoInstrucao.instrucao, estadoInstrucao);
+        else
+            this.alocaFU(UFParaUsar, estadoInstrucao.instrucao, estadoInstrucao);
+
+        if ((UFParaUsar.tipoUnidade !== 'Store') && (UFParaUsar.operacao !== 'BEQ') && (UFParaUsar.operacao !== 'BNEZ'))
+            this.escreveEstacaoRegistrador(estadoInstrucao.instrucao, robTag);
+
+        if (tipoInstrucao === "branch") {
+            this.especulando = true;
+            this.branchRobIndex = entradaROB.indice;
+            this.snapshotEstacaoRegistradores = JSON.parse(JSON.stringify(this.estacaoRegistradores));
+        }
+
+        return true;
+    }
+
+    issueNovaInstrucao() {
+        // funcao da fase de issue do tomasulo (simples ou despacho duplo)
+        const instrucaoN = this.getNovaInstrucao();
+        if (!instrucaoN) {
+            return;
+        }
+
+        if (!this.despachoDuplo) {
+            this.tentaEmitirInstrucao(instrucaoN, false);
+            return;
+        }
+
+        const emitiuPrimeira = this.tentaEmitirInstrucao(instrucaoN, false);
+        if (!emitiuPrimeira) {
+            return;
+        }
+
+        const instrucaoN1 = this.getNovaInstrucaoDepois(instrucaoN.indice);
+        if (!instrucaoN1) {
+            return;
+        }
+
+        const opN1 = instrucaoN1.instrucao.operacao;
+        if (opN1 === "BEQ" || opN1 === "BNEZ") {
+            return;
+        }
+
+        const destinoN = instrucaoN.instrucao.registradorR;
+        const destinoN1 = instrucaoN1.instrucao.registradorR;
+        if (destinoN && destinoN1 && destinoN === destinoN1) {
+            return;
+        }
+
+        this.tentaEmitirInstrucao(instrucaoN1, true);
     }
 
     executaInstrucao() {
@@ -438,54 +571,152 @@
     }
 
     escreveInstrucao() {
-        // fase de escrita do tomasulo
+        // fase de escrita do tomasulo com arbitragem de CDB (somente 1 escrita/ciclo)
+        let cdbUsadoNesteCiclo = false;
+        const candidatos = [];
+        const prioridade = { "Load": 0, "Add": 1, "Mult": 2, "Integer": 3 };
 
-        // percorre todas as unidades funcionais de memoria
-        for(let key in this.unidadesFuncionaisMemoria) {
+        for (let key in this.unidadesFuncionaisMemoria) {
             const ufMem = this.unidadesFuncionaisMemoria[key];
-
-            // caso a unidade esteja ocupada e o tempo for -1
-            if (ufMem.ocupado === true) {
-                if (ufMem.tempo === -1) {
-                    ufMem.estadoInstrucao.write = this.clock;   //escreve em qual ciclo escreveu no registrador
-
-                    // verifica qual é o nome que esta na estacao de registradores
-                    let valorReg = this.estacaoRegistradores[ufMem.instrucao.registradorR];
-
-                    // se nenhuma outra uf vai escrever sobre o registrador, escreve nele
-                    if (valorReg === ufMem.nome) {
-                        this.estacaoRegistradores[ufMem.instrucao.registradorR] = 'VAL(' + ufMem.nome + ')';
-                    }
-
-                    // libera as ufs que esta esperando essa terminar e desaloca essa uf
-                    this.liberaUFEsperandoResultado(ufMem);
-                    this.desalocaUFMem(ufMem);
-                }
+            if (ufMem.ocupado === true && ufMem.tempo === -1) {
+                candidatos.push({ uf: ufMem, memoria: true, prioridade: prioridade["Load"] });
             }
         }
 
-        // percorre todas as unidades funcionais
-        for(let key in this.unidadesFuncionais) {
+        for (let key in this.unidadesFuncionais) {
             const uf = this.unidadesFuncionais[key];
-
-            // caso a unidade esteja ocupada e o tempo for -1
-            if (uf.ocupado === true) {
-                if (uf.tempo === -1) {
-                    uf.estadoInstrucao.write = this.clock;   //escreve em qual ciclo escreveu no registrador
-
-                    // verifica qual é o nome que esta na estacao de registradores
-                    let valorReg = this.estacaoRegistradores[uf.instrucao.registradorR];
-
-                    // se nenhuma outra uf vai escrever sobre o registrador, escreve nele
-                    if (valorReg === uf.nome) {
-                        this.estacaoRegistradores[uf.instrucao.registradorR] = 'VAL(' + uf.nome + ')';
-                    }
-
-                    // libera as ufs que esta esperando essa terminar e desaloca essa uf
-                    this.liberaUFEsperandoResultado(uf);
-                    this.desalocaUF(uf);
-                }
+            if (uf.ocupado === true && uf.tempo === -1) {
+                const prioridadeUF = (prioridade[uf.tipoUnidade] !== undefined) ? prioridade[uf.tipoUnidade] : 3;
+                candidatos.push({ uf: uf, memoria: false, prioridade: prioridadeUF });
             }
+        }
+
+        candidatos.sort((a, b) => a.prioridade - b.prioridade);
+        if (candidatos.length === 0 || cdbUsadoNesteCiclo) {
+            return;
+        }
+
+        const selecionado = candidatos[0];
+        const uf = selecionado.uf;
+        const robTag = uf.robTag;
+        const entradaROB = this.getEntradaROBPorTag(robTag);
+        if (entradaROB) {
+            entradaROB.valor = 'VAL(' + robTag + ')';
+            entradaROB.pronto = true;
+        }
+        uf.estadoInstrucao.write = this.clock;
+        this.liberaUFEsperandoResultado(uf, robTag);
+
+        if (selecionado.memoria) {
+            this.desalocaUFMem(uf);
+        } else {
+            this.desalocaUF(uf);
+        }
+        cdbUsadoNesteCiclo = true;
+    }
+
+    resolveBranch(entradaROB) {
+        const op = entradaROB.instrucao.operacao;
+        if (op === "BNEZ") {
+            return true;
+        }
+        if (op === "BEQ") {
+            return false;
+        }
+        return false;
+    }
+
+    flushEspeculacao(entradaBranch) {
+        this.instrucoesPendenteFlush = [];
+        this.flushTagsNoCiclo = {};
+
+        for (let i = 0; i < this.rob.length; i++) {
+            const entrada = this.rob[i];
+            if (!entrada.especulativo) {
+                continue;
+            }
+            this.instrucoesPendenteFlush.push(entrada.estadoInstrucao.indice);
+            this.flushTagsNoCiclo["ROB" + entrada.indice] = this.clock;
+            entrada.estadoInstrucao.issue = null;
+            entrada.estadoInstrucao.exeCompleta = null;
+            entrada.estadoInstrucao.write = null;
+            entrada.estadoInstrucao.commit = null;
+            entrada.estadoInstrucao.robTag = null;
+            entrada.estadoInstrucao.busy = false;
+            entrada.estadoInstrucao.despachoSegundo = false;
+        }
+
+        // remove entradas especulativas do ROB
+        this.rob = this.rob.filter(e => !e.especulativo);
+        this.robCount = this.rob.length;
+        if (this.robCount > 0) {
+            this.robHead = this.rob[0].indice;
+            this.robTail = (this.rob[this.rob.length - 1].indice + 1) % this.robCapacidade;
+        } else {
+            this.robHead = 0;
+            this.robTail = 0;
+        }
+
+        // desaloca UFs especulativas em voo
+        for (let key in this.unidadesFuncionais) {
+            const uf = this.unidadesFuncionais[key];
+            if (uf.ocupado && uf.robTag && this.flushTagsNoCiclo[uf.robTag]) {
+                this.desalocaUF(uf);
+            }
+        }
+        for (let key in this.unidadesFuncionaisMemoria) {
+            const ufMem = this.unidadesFuncionaisMemoria[key];
+            if (ufMem.ocupado && ufMem.robTag && this.flushTagsNoCiclo[ufMem.robTag]) {
+                this.desalocaUFMem(ufMem);
+            }
+        }
+
+        // restaura o mapeamento de registradores para o ponto pré-branch
+        if (this.snapshotEstacaoRegistradores) {
+            this.estacaoRegistradores = JSON.parse(JSON.stringify(this.snapshotEstacaoRegistradores));
+        }
+
+        entradaBranch.pronto = true;
+        this.especulando = false;
+        this.branchRobIndex = null;
+        this.snapshotEstacaoRegistradores = null;
+    }
+
+    commitaROB() {
+        const cabeca = this.getCabecaROB();
+        if (!cabeca || !cabeca.pronto) {
+            return;
+        }
+
+        if (cabeca.tipoInstrucao === "branch") {
+            const branchTomado = this.resolveBranch(cabeca);
+            const branchPreditoTomado = (this.branchPrediction === "taken");
+            const misprediction = branchTomado !== branchPreditoTomado;
+            if (misprediction) {
+                this.flushEspeculacao(cabeca);
+            } else {
+                this.especulando = false;
+                this.branchRobIndex = null;
+                this.snapshotEstacaoRegistradores = null;
+            }
+        }
+
+        if (cabeca.tipoInstrucao === "normal" && cabeca.registradorDestino) {
+            if (this.estacaoRegistradores[cabeca.registradorDestino] === ("ROB" + cabeca.indice)) {
+                this.estacaoRegistradores[cabeca.registradorDestino] = cabeca.valor || ("VAL(ROB" + cabeca.indice + ")");
+            }
+        } else if (cabeca.tipoInstrucao === "store") {
+            cabeca.valor = "MEM[" + cabeca.instrucao.registradorS + "+" + cabeca.instrucao.registradorT + "]";
+        }
+
+        cabeca.commitado = true;
+        cabeca.estadoInstrucao.commit = this.clock;
+
+        this.rob = this.rob.filter(e => e.indice !== cabeca.indice);
+        this.robCount = this.rob.length;
+        this.robHead = (this.robHead + 1) % this.robCapacidade;
+        if (this.robCount === 0) {
+            this.robHead = this.robTail;
         }
     }
 
@@ -498,6 +729,7 @@
         this.issueNovaInstrucao();
         this.executaInstrucao();
         this.escreveInstrucao();
+        this.commitaROB();
 
         // prints no console para debug
         console.log('Estado instrução:');
@@ -511,6 +743,8 @@
 
         console.log('Estado registradores:');
         console.log(JSON.stringify(this.estacaoRegistradores, null, 2));
+        console.log('Estado ROB:');
+        console.log(JSON.stringify(this.rob, null, 2));
 
         // retorna se a execucao de todas as instrucoes acabou ou nao
         return this.verificaSeJaTerminou();
@@ -566,7 +800,7 @@ function getConfig() {
     unidadesMem["Store"] = $("#fuStore").val();
 
 
-    if(unidades["Load"] < 1 || unidadesMem["Store"] < 1) {
+    if(unidadesMem["Load"] < 1 || unidadesMem["Store"] < 1) {
         alert("A quantidade de unidades funcionais de memória deve ser no mínimo 1!");
         return;
     }
@@ -574,6 +808,9 @@ function getConfig() {
 
     conf["unidades"] = unidades;
     conf["unidadesMem"] = unidadesMem;
+    conf["despachoDuplo"] = $("#despachoDuplo").is(":checked");
+    conf["robSize"] = parseInt($("#robSize").val() || "8");
+    conf["branchPrediction"] = $("#branchPrediction").val() || "not-taken";
     return conf;
 }
 
@@ -727,53 +964,58 @@ function atualizaTabelaEstadoInstrucaoHTML(tabelaInsts) {
         $(`#i${inst["posicao"]}_is`).text(inst["issue"] ? inst["issue"] : "");
         $(`#i${inst["posicao"]}_ec`).text(inst["exeCompleta"] ? inst["exeCompleta"] : "");
         $(`#i${inst["posicao"]}_wr`).text(inst["write"] ? inst["write"] : "");
+        let despacho = "-";
+        if (diagrama && diagrama.despachoDuplo && inst["issue"] !== null) {
+            despacho = inst["despachoSegundo"] ? "2ª" : "1ª";
+        }
+        $(`#i${inst["posicao"]}_dp`).text(despacho);
     }
 }
 
-function atualizaTabelaBufferReordenamentoHTML(tabelaInsts) {
-    for(let i in tabelaInsts) {
-        const inst = tabelaInsts[i];
-        console.log("EXECUÇÃO COMPLETA INSTRUCAO TESTE", inst["busy"], inst["posicao"], inst["instrucao"].operacao);
-        $(`#${inst["posicao"]}_destiny`).text(inst["instrucao"].registradorR);
+function atualizaTabelaROBHTML(rob) {
+    $("#robBody").html("");
+    if (!diagrama) {
+        return;
+    }
 
-        if (inst["issue"] != null) {            
-            $(`#${inst["posicao"]}_estado`).text("Execute");
-            $(`#${inst["posicao"]}_busy`).text("sim");
+    $("#robHeadTail").text(`Head: ROB${diagrama.robHead} | Tail: ROB${diagrama.robTail}`);
+
+    for (let i = 0; i < rob.length; i++) {
+        const entrada = rob[i];
+        const robTag = "ROB" + entrada.indice;
+        let status = "Executando";
+        if (entrada.tipoInstrucao === "branch" && diagrama.especulando && diagrama.branchRobIndex === entrada.indice) {
+            status = "Branch (especulando)";
+        } else if (entrada.especulativo) {
+            status = "Especulativo";
+        } else if (entrada.commitado) {
+            status = "Commitado";
+        } else if (entrada.pronto) {
+            status = "Pronto";
         }
 
-        if (inst["exeCompleta"] != null) {            
-            $(`#${inst["posicao"]}_estado`).text("Write Result");
-
-            if ( inst["instrucao"].operacao == "SD" || inst["instrucao"].operacao == "LD" ) {
-
-                $(`#${inst["posicao"]}_value`).text("Mem["+inst["instrucao"].registradorS+" + Regs[" + inst["instrucao"].registradorT + "]]");
-
-            } else if ( inst["instrucao"].operacao == "ADDD" || inst["instrucao"].operacao == "ADD" || inst["instrucao"].operacao == "DADDUI" ) {
-
-                $(`#${inst["posicao"]}_value`).text(inst["instrucao"].registradorS+" + " + inst["instrucao"].registradorT);
-
-            } else if ( inst["instrucao"].operacao == "SUBD" ) {
-
-                $(`#${inst["posicao"]}_value`).text(inst["instrucao"].registradorS+" - " + inst["instrucao"].registradorT);
-
-            } else if ( inst["instrucao"].operacao == "MULTD" ) {
-
-                $(`#${inst["posicao"]}_value`).text(inst["instrucao"].registradorS+" * " + inst["instrucao"].registradorT);
-
-            } else if ( inst["instrucao"].operacao == "DIVD" ) {
-
-                $(`#${inst["posicao"]}_value`).text(inst["instrucao"].registradorS+" / " + inst["instrucao"].registradorT);
-
-            }
+        let classe = "";
+        if (diagrama.flushTagsNoCiclo[robTag] === diagrama.clock) {
+            classe = "rob-flush";
+        } else if (entrada.tipoInstrucao === "branch") {
+            classe = "rob-branch";
+        } else if (entrada.especulativo) {
+            classe = "rob-especulativo";
+        } else if (entrada.pronto && entrada.indice === diagrama.robHead) {
+            classe = "rob-head-pronto";
         }
 
-        if (inst["write"] != null) {            
-            $(`#${inst["posicao"]}_estado`).text("Commit");
-            $(`#${inst["posicao"]}_busy`).text("não");
-        }
-
-        $(`#i${inst["posicao"]}_ec`).text(inst["exeCompleta"] ? inst["exeCompleta"] : "");
-        $(`#i${inst["posicao"]}_wr`).text(inst["write"] ? inst["write"] : "");
+        $("#robBody").append(
+            `<tr class="${classe}">
+                <td>${robTag}</td>
+                <td>${diagrama.getInstrucaoTexto(entrada.instrucao)}</td>
+                <td>${entrada.registradorDestino ? entrada.registradorDestino : "—"}</td>
+                <td>${entrada.valor ? entrada.valor : "—"}</td>
+                <td>${entrada.pronto ? "Sim" : "Não"}</td>
+                <td>${entrada.especulativo ? "Sim" : "Não"}</td>
+                <td>${status}</td>
+            </tr>`
+        );
     }
 }
 
@@ -807,7 +1049,7 @@ function gerarTabelaEstadoInstrucaoHTML(diagrama) {
     var s = (
         "<h3>Status das instruções</h3><table class='table table-striped table-hover'>"
         + "<tr><th></th><th>Instrução</th><th>i</th><th>j</th>"
-        + "<th>k</th><th>Issue</th><th>Exec. Completa</th><th>Write Result</th></tr>"
+        + "<th>k</th><th>Issue</th><th>Exec. Completa</th><th>Write Result</th><th>Despacho</th></tr>"
     );
 
     for (let i = 0 ; i < diagrama.configuracao["numInstrucoes"]; ++i) {
@@ -816,7 +1058,7 @@ function gerarTabelaEstadoInstrucaoHTML(diagrama) {
             `<tr> <td>I${i}</td> <td>${instrucao["operacao"]}</td>
             <td>${instrucao["registradorR"]}</td> <td>${instrucao["registradorS"]}</td> <td>${instrucao["registradorT"]}</td>
             <td id='i${i}_is'></td></td> <td id='i${i}_ec'></td>
-            <td id='i${i}_wr'></td> </tr>`
+            <td id='i${i}_wr'></td><td id='i${i}_dp'>-</td> </tr>`
         );
     }
 
@@ -824,22 +1066,17 @@ function gerarTabelaEstadoInstrucaoHTML(diagrama) {
     $("#estadoInst").html(s);
 }
 
-function gerarTabelaBufferReordenamento(diagrama) {
+function gerarTabelaROBHTML(diagrama) {
     var s = (
-        "<h3>Buffer de Reordenamento</h3><table class='table table-striped table-hover'>"
-        + "<tr><th>Entrada</th><th>Ocupado</th><th>Instrução</th>"
-        + "<th>Estado</th><th>Destino</th><th>Valor</th></tr>"
+        "<h3>Buffer de Reordenamento</h3>"
+        + "<div id='robHeadTail' class='mb-2'>Head: ROB0 | Tail: ROB0</div>"
+        + "<table class='table table-striped table-hover'>"
+        + "<tr><th>Entrada</th><th>Instrução</th><th>Destino</th>"
+        + "<th>Valor</th><th>Pronto</th><th>Especulativo</th><th>Status</th></tr>"
     );
-    for (let i = 0 ; i < diagrama.configuracao["numInstrucoes"]; ++i) {
-        let instrucao = diagrama.estadoInstrucoes[i].instrucao;
-        s += (
-            `<tr><td>${i}</td>
-           <td id="`+ i +`_busy">não</td> <td>${instrucao["operacao"]} ${instrucao["registradorR"]}, ${instrucao["registradorS"]}, ${instrucao["registradorT"]}</td> <td id="`+ i +`_estado">Issue</td>
-           <td id="`+ i +`_destiny"></td> <td id="`+ i +`_value"></td>`
-        );
-    }
-    s += "</table>";
+    s += "<tbody id='robBody'></tbody></table>";
     $("#bufferReord").html(s);
+    atualizaTabelaROBHTML(diagrama.rob);
 }
 
 function gerarTabelaEstadoUFHTML(diagrama) {
@@ -955,11 +1192,19 @@ function carregaExemplo(exN = false) {
         confirmou = true;
     }
     confirmou = true;
-    $.getJSON(`./presets/ex${exN}.json`, function() {
+    // aceita formatos antigos (01, 02, ...) e novos (ex_raw, ex_waw, ...)
+    let caminhoPreset = "";
+    if (typeof exN === "string" && exN.startsWith("ex_")) {
+        caminhoPreset = `./presets/${exN}.json`;
+    } else {
+        caminhoPreset = `./presets/ex${exN}.json`;
+    }
+
+    $.getJSON(caminhoPreset, function() {
         console.log("Lido :3");
 
     }).fail(function() {
-        alert("Não foi possivel carregar o exemplo.")
+        alert("Não foi possivel carregar o exemplo.");
     }).done(function(data) {
         $("#nInst").val(data["insts"].length);
         var confirmou = confirmarNInst();
@@ -979,6 +1224,23 @@ function carregaExemplo(exN = false) {
             $(`#${key}`).val(parseInt(data["config"]["unidades"][key]));
         }
 
+        if (data["config"]["despachoDuplo"]) {
+            $("#despachoDuplo").prop("checked", true);
+        } else {
+            $("#despachoDuplo").prop("checked", false);
+        }
+
+        if (data["config"]["robSize"]) {
+            $("#robSize").val(parseInt(data["config"]["robSize"]));
+        } else {
+            $("#robSize").val(8);
+        }
+
+        if (data["config"]["branchPrediction"]) {
+            $("#branchPrediction").val(data["config"]["branchPrediction"]);
+        } else {
+            $("#branchPrediction").val("not-taken");
+        }
 
     });
 }
@@ -992,6 +1254,42 @@ function confirmarNInst() {
     }
     geraTabelaParaInserirInstrucoes(nInst);
     return true;
+}
+
+function garanteCamposAvancadosConfiguracao() {
+    if ($("#robSize").length > 0 && $("#branchPrediction").length > 0 && $("#despachoDuplo").length > 0) {
+        return;
+    }
+
+    const ancora = $("#fuFPAdd").closest(".form-group");
+    if (ancora.length === 0) {
+        return;
+    }
+
+    const bloco = `
+        <p class="w-100 mt-2">Especulação e despacho</p>
+        <div class="form-group col-md-6">
+            <label class="form-label" for="robSize">Tamanho do ROB:</label>
+            <input type="number" class="form-control" min="2" max="16" value="8" name="robSize" id="robSize"/>
+        </div>
+        <div class="form-group col-md-6">
+            <label class="form-label" for="branchPrediction">Predição de branch:</label>
+            <select class="form-control" name="branchPrediction" id="branchPrediction">
+                <option value="not-taken" selected>not-taken</option>
+                <option value="taken">taken</option>
+            </select>
+        </div>
+        <div class="form-group col-md-12 mt-2">
+            <div class="form-check">
+                <input class="form-check-input" type="checkbox" value="" id="despachoDuplo">
+                <label class="form-check-label" for="despachoDuplo">
+                    Despacho Duplo (Superscalar 2-wide)
+                </label>
+            </div>
+        </div>
+    `;
+
+    ancora.after(bloco);
 }
 
 
@@ -1011,10 +1309,14 @@ function limparCampos() {
     $("#fuInt").val(1);
     $("#fuFPAdd").val(1);
     $("#fuFPMul").val(1);
+    $("#robSize").val(8);
+    $("#branchPrediction").val("not-taken");
+    $("#despachoDuplo").prop("checked", false);
 
     $("#clock").html("");
     $("#estadoInst").html("");
-    $("#estadoMemUF").html("");getAllInst();
+    $("#estadoMemUF").html("");
+    $("#bufferReord").html("");
     $("#estadoUF").html("");
     $("#estadoMem").html("");
 }
@@ -1038,15 +1340,15 @@ function limparCampos() {
      }
      diagrama = new Estado(CONFIG, insts);
      gerarTabelaEstadoInstrucaoHTML(diagrama);
-     gerarTabelaBufferReordenamento(diagrama);
-     atualizaTabelaEstadoInstrucaoHTML(diagrama["tabela"])
+    gerarTabelaROBHTML(diagrama);
+    atualizaTabelaEstadoInstrucaoHTML(diagrama.estadoInstrucoes)
      gerarTabelaEstadoUFHTML(diagrama);
      console.log('diagrama UF porra', diagrama["unidadesFuncionais"]);
      atualizaTabelaEstadoUFHTML(diagrama["unidadesFuncionais"]);
      gerarTabelaEstadoMenHTML(diagrama);
      gerarTabelaEstadoUFMem(diagrama);
-     atualizaTabelaEstadoUFMemHTML(diagrama["ufMem"]);
-     atualizaTabelaBufferReordenamentoHTML(diagrama["ufMem"]);
+    atualizaTabelaEstadoUFMemHTML(diagrama.unidadesFuncionaisMemoria);
+    atualizaTabelaROBHTML(diagrama.rob);
      terminou = false;
      $("#clock").html("Clock: 0");
      $('#configuracoesview').hide('slow');
@@ -1071,7 +1373,7 @@ function verificaNInst() {
      // terminou = avancaCiclo(diagrama);
      terminou = diagrama.executa_ciclo();
      atualizaTabelaEstadoInstrucaoHTML(diagrama.estadoInstrucoes);
-     atualizaTabelaBufferReordenamentoHTML(diagrama.estadoInstrucoes);
+    atualizaTabelaROBHTML(diagrama.rob);
      atualizaTabelaEstadoUFMemHTML(diagrama.unidadesFuncionaisMemoria);
      atualizaTabelaEstadoUFHTML(diagrama.unidadesFuncionais);
      atualizaTabelaEstadoMenHTML(diagrama.estacaoRegistradores);
@@ -1084,14 +1386,19 @@ function verificaNInst() {
          //alert("Envie primeiro");
          return;
      }
-     while(!terminou) {
+    let limiteCiclos = 500;
+    while(!terminou && limiteCiclos > 0) {
          terminou = diagrama.executa_ciclo();
          atualizaTabelaEstadoInstrucaoHTML(diagrama.estadoInstrucoes);
-         atualizaTabelaBufferReordenamentoHTML(diagrama.estadoInstrucoes);
+        atualizaTabelaROBHTML(diagrama.rob);
          atualizaTabelaEstadoUFMemHTML(diagrama.unidadesFuncionaisMemoria);
          atualizaTabelaEstadoUFHTML(diagrama.unidadesFuncionais);
          atualizaTabelaEstadoMenHTML(diagrama.estacaoRegistradores);
          atualizaClock(diagrama.clock);
+        limiteCiclos--;
+    }
+    if (!terminou && limiteCiclos === 0) {
+        alert("Execução interrompida após 500 ciclos para evitar loop infinito.");
      }
  }
 
@@ -1116,6 +1423,6 @@ $(document).ready(function() {
 
     // $("#enviar").click(enviar());
 
-    $("#proximo").click(proximoFunctionN());
-    $("#resultado").click(resultadobtn());
+    $("#proximo").click(proximoFunctionN);
+    $("#resultado").click(resultadobtn);
 });

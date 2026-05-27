@@ -1,0 +1,23 @@
+{
+  "config": {
+    "ciclos": {
+      "ciclosInt": 1,
+      "ciclosLoad": 2,
+      "ciclosStore": 2,
+      "ciclosFPAdd": 2,
+      "ciclosFPMul": 8,
+      "ciclosFPDiv": 12
+    },
+    "unidades": {
+      "fuLoad": 1,
+      "fuStore": 1,
+      "fuInt": 1,
+      "fuFPAdd": 2,
+      "fuFPMul": 1
+    }
+  },
+  "insts": [
+    { "D": "ADDD", "R": "F2", "S": "F4", "T": "F6" },
+    { "D": "ADDD", "R": "F8", "S": "F10", "T": "F12" }
+  ]
+}

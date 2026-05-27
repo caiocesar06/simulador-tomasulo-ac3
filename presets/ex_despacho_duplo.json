@@ -1,0 +1,27 @@
+{
+  "config": {
+    "ciclos": {
+      "ciclosInt": 1,
+      "ciclosLoad": 2,
+      "ciclosStore": 2,
+      "ciclosFPAdd": 4,
+      "ciclosFPMul": 8,
+      "ciclosFPDiv": 12
+    },
+    "unidades": {
+      "fuLoad": 1,
+      "fuStore": 1,
+      "fuInt": 1,
+      "fuFPAdd": 1,
+      "fuFPMul": 1
+    },
+    "despachoDuplo": true,
+    "branchPrediction": "not-taken",
+    "robSize": 8
+  },
+  "insts": [
+    { "D": "ADDD", "R": "F2", "S": "F4", "T": "F6" },
+    { "D": "LD", "R": "F8", "S": "0", "T": "R0" },
+    { "D": "MULTD", "R": "F10", "S": "F2", "T": "F8" }
+  ]
+}

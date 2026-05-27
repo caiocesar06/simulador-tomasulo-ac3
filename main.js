@@ -17,10 +17,19 @@ function getRandomInt() {
 function include(file, elementIdToSetContent) {
     fetch(file+'?'+getRandomInt())
         .then((result) => {
+            if (!result.ok) {
+                throw new Error(`Falha ao carregar ${file}: HTTP ${result.status}`);
+            }
             return result.text();
         })
         .then((content) => {
             document.getElementById(elementIdToSetContent).innerHTML = content;
+            if (elementIdToSetContent === "configuracoesview" && window.garanteCamposAvancadosConfiguracao) {
+                window.garanteCamposAvancadosConfiguracao();
+            }
+        })
+        .catch((error) => {
+            console.error(error);
         });
 }
 
